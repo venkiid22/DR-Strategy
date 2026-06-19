@@ -1,0 +1,92 @@
+# ============================================================
+#  Prometheus Alert Rules — MLOps Platform
+#  people.inc | Author: Venkatesh Nagelli
+# ============================================================
+
+groups:
+
+  - name: model-serving-slo
+    rules:
+
+      - alert: ModelHighPredictionLatency
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(model_prediction_duration_seconds_bucket{
+              namespace="mlops-prod"
+            }[5m])) by (le, model_name)
+          ) * 1000 > 100
+        for: 2m
+        labels:
+          severity: warning
+          team: mlops
+        annotations:
+          summary: "Model {{ $labels.model_name }} p95 latency > 100ms"
+          description: "Prediction latency is {{ $value | printf \"%.0f\" }}ms"
+
+      - alert: ModelHighErrorRate
+        expr: |
+          sum(rate(model_prediction_errors_total{
+            namespace="mlops-prod"
+          }[5m])) by (model_name)
+          /
+          sum(rate(model_predictions_total{
+            namespace="mlops-prod"
+          }[5m])) by (model_name) * 100 > 1
+        for: 1m
+        labels:
+          severity: critical
+          pagerduty: "true"
+        annotations:
+          summary: "Model {{ $labels.model_name }} error rate > 1%"
+          description: "Error rate: {{ $value | printf \"%.2f\" }}%"
+
+      - alert: ModelAccuracyDrift
+        expr: |
+          model_accuracy_current{namespace="mlops-prod"}
+          <
+          model_accuracy_baseline{namespace="mlops-prod"} - 0.02
+        for: 10m
+        labels:
+          severity: warning
+          team: mlops
+        annotations:
+          summary: "Model {{ $labels.model_name }} accuracy drift detected"
+          description: "Accuracy dropped > 2% from baseline — retraining may be needed"
+
+      - alert: GPUUtilizationLow
+        expr: |
+          avg(nvidia_gpu_utilization_gpu{
+            namespace="mlops-prod"
+          }) < 30
+        for: 30m
+        labels:
+          severity: info
+          team: mlops
+        annotations:
+          summary: "GPU utilization low — consider scaling down"
+          description: "Average GPU utilization is {{ $value }}% — idle GPUs cost money"
+
+      - alert: ModelServingPodsDown
+        expr: |
+          kube_deployment_status_replicas_ready{
+            namespace="mlops-prod",
+            deployment="ai-model-server"
+          } < 1
+        for: 1m
+        labels:
+          severity: critical
+          pagerduty: "true"
+        annotations:
+          summary: "🚨 No model serving pods are ready"
+          description: "ai-model-server has 0 ready pods — all predictions failing"
+
+      - alert: MLflowTrackingDown
+        expr: |
+          up{job="mlflow", namespace="mlops-prod"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          team: mlops
+        annotations:
+          summary: "MLflow tracking server is down"
+          description: "MLflow has been unreachable for 5 minutes — training runs cannot be logged"

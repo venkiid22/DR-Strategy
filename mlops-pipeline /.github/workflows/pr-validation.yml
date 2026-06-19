@@ -1,0 +1,135 @@
+# ============================================================
+#  GitHub Actions — PR Validation
+#  people.inc MLOps Platform
+#  Author: Venkatesh Nagelli | people.inc
+# ============================================================
+
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+
+  lint:
+    name: 🔍 Lint & Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install linting tools
+        run: pip install flake8 black isort mypy
+
+      - name: Flake8
+        run: flake8 scripts/mlops/ --max-line-length=120
+
+      - name: Black format check
+        run: black --check scripts/mlops/
+
+      - name: isort check
+        run: isort --check-only scripts/mlops/
+
+      - name: Lint shell scripts
+        run: |
+          sudo apt-get install -y shellcheck -q
+          find scripts/ -name "*.sh" -exec shellcheck {} \;
+
+      - name: Validate Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.6.x"
+      - run: |
+          cd terraform/environments/prod
+          terraform init -backend=false
+          terraform validate
+          terraform fmt -check -recursive
+
+      - name: Lint Kubernetes manifests
+        run: |
+          curl -sSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz | tar xz
+          ./kubeconform -strict kubernetes/base/
+
+  test:
+    name: 🧪 Unit Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install pytest pytest-cov \
+            scikit-learn pandas numpy xgboost mlflow boto3 \
+            great-expectations
+
+      - name: Run unit tests
+        run: |
+          pytest tests/unit/ \
+            --cov=scripts/mlops \
+            --cov-report=xml:coverage.xml \
+            --cov-fail-under=80 \
+            -v
+
+      - uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+
+  security:
+    name: 🛡️ Security Scan
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trivy filesystem scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+      - uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  summary:
+    name: 📋 PR Summary
+    runs-on: ubuntu-latest
+    needs: [lint, test, security]
+    if: always()
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const lint     = '${{ needs.lint.result }}';
+            const test     = '${{ needs.test.result }}';
+            const security = '${{ needs.security.result }}';
+            const e = r => r === 'success' ? '✅' : '❌';
+            const ok = [lint, test, security].every(r => r === 'success');
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## ${ok ? '✅' : '❌'} CI Results\n\n| Check | Status |\n|---|---|\n| 🔍 Lint | ${e(lint)} ${lint} |\n| 🧪 Tests | ${e(test)} ${test} |\n| 🛡️ Security | ${e(security)} ${security} |\n\n${ok ? 'All checks passed — ready for review.' : 'One or more checks failed.'}`
+            });

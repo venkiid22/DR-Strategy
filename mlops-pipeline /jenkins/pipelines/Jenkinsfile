@@ -1,0 +1,462 @@
+#!/usr/bin/env groovy
+// ============================================================
+//  MLOps CI/CD Pipeline — people.inc
+//  Covers: lint → train → evaluate → build → deploy (dev/prod)
+//  Author: Venkatesh Nagelli | people.inc
+// ============================================================
+
+@Library('mlops-shared-libs') _
+
+def APP_NAME       = "ai-model-server"
+def ECR_REGISTRY   = "${env.AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
+def ECR_REPO       = "${ECR_REGISTRY}/${APP_NAME}"
+def MLFLOW_URI     = "http://mlflow.mlops.svc.cluster.local:5000"
+def IMAGE_TAG      = ""
+def MODEL_VERSION  = ""
+
+pipeline {
+
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    app: jenkins-mlops-agent
+spec:
+  serviceAccountName: jenkins-sa
+  containers:
+  - name: python
+    image: python:3.11-slim
+    command: ['sleep', '99d']
+    resources:
+      requests: { memory: "2Gi", cpu: "1000m" }
+      limits:   { memory: "4Gi", cpu: "2000m" }
+  - name: docker
+    image: docker:24-dind
+    securityContext:
+      privileged: true
+    volumeMounts:
+    - name: docker-sock
+      mountPath: /var/run/docker.sock
+  - name: kubectl
+    image: bitnami/kubectl:1.28
+    command: ['sleep', '99d']
+  - name: helm
+    image: alpine/helm:3.13.0
+    command: ['sleep', '99d']
+  - name: trivy
+    image: aquasec/trivy:latest
+    command: ['sleep', '99d']
+  volumes:
+  - name: docker-sock
+    hostPath:
+      path: /var/run/docker.sock
+"""
+        }
+    }
+
+    environment {
+        AWS_REGION        = "us-east-1"
+        AWS_ACCOUNT_ID    = credentials('aws-account-id')
+        MLFLOW_TRACKING   = "${MLFLOW_URI}"
+        SLACK_WEBHOOK     = credentials('slack-webhook-mlops')
+        KUBECONFIG        = credentials('eks-kubeconfig-prod')
+        S3_MODEL_BUCKET   = "people-inc-model-artifacts"
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        timeout(time: 120, unit: 'MINUTES')
+        timestamps()
+        ansiColor('xterm')
+        disableConcurrentBuilds(abortPrevious: true)
+    }
+
+    parameters {
+        choice(
+            name: 'DEPLOY_ENV',
+            choices: ['dev', 'prod'],
+            description: 'Target deployment environment'
+        )
+        string(
+            name: 'MODEL_NAME',
+            defaultValue: 'people-inc-ai-model',
+            description: 'MLflow model name to train and deploy'
+        )
+        booleanParam(
+            name: 'FORCE_RETRAIN',
+            defaultValue: false,
+            description: 'Force model retraining even if no data changes'
+        )
+        string(
+            name: 'MIN_ACCURACY',
+            defaultValue: '0.85',
+            description: 'Minimum model accuracy required to deploy'
+        )
+    }
+
+    stages {
+
+        // ── STAGE 1: Initialise ──────────────────────────────
+        stage('🔧 Initialise') {
+            steps {
+                script {
+                    IMAGE_TAG = "${env.BUILD_NUMBER}-${sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()}"
+                    currentBuild.displayName = "#${env.BUILD_NUMBER} | ${params.MODEL_NAME} | ${params.DEPLOY_ENV}"
+                    echo """
+╔══════════════════════════════════════════════════╗
+║   people.inc MLOps Pipeline                      ║
+║   Model  : ${params.MODEL_NAME}                  
+║   Image  : ${APP_NAME}:${IMAGE_TAG}              
+║   Env    : ${params.DEPLOY_ENV}                  
+╚══════════════════════════════════════════════════╝
+"""
+                }
+            }
+        }
+
+        // ── STAGE 2: Lint & Unit Tests ───────────────────────
+        stage('🔍 Lint & Unit Tests') {
+            steps {
+                container('python') {
+                    sh """
+                        pip install --quiet \
+                          flake8 pytest pytest-cov black isort \
+                          mlflow scikit-learn pandas numpy torch
+
+                        echo "── Linting ──"
+                        flake8 scripts/mlops/ \
+                          --max-line-length=120 \
+                          --exclude=__pycache__
+
+                        echo "── Format check ──"
+                        black --check scripts/mlops/
+                        isort --check-only scripts/mlops/
+
+                        echo "── Unit tests ──"
+                        pytest tests/unit/ \
+                          --cov=scripts/mlops \
+                          --cov-report=xml:coverage.xml \
+                          --cov-fail-under=80 \
+                          -v
+                    """
+                }
+            }
+            post {
+                always {
+                    publishCoverage(
+                        adapters: [coberturaAdapter('coverage.xml')],
+                        sourceFileResolver: sourceFiles('STORE_LAST_BUILD')
+                    )
+                }
+            }
+        }
+
+        // ── STAGE 3: Data Validation ─────────────────────────
+        stage('📊 Data Validation') {
+            steps {
+                container('python') {
+                    sh """
+                        pip install --quiet great-expectations boto3
+
+                        python3 -c "
+import great_expectations as ge
+import boto3, json
+
+# Pull latest dataset from S3
+s3 = boto3.client('s3', region_name='us-east-1')
+s3.download_file(
+    '${S3_MODEL_BUCKET}',
+    'datasets/latest/train.csv',
+    '/tmp/train.csv'
+)
+
+df = ge.read_csv('/tmp/train.csv')
+
+# Validate schema and quality
+results = df.expect_column_to_exist('label')
+results = df.expect_column_values_to_not_be_null('label')
+results = df.expect_column_values_to_be_between(
+    'confidence_score', min_value=0.0, max_value=1.0
+)
+
+suite = df.get_expectation_suite()
+validation = df.validate(expectation_suite=suite)
+
+if not validation['success']:
+    print('❌ Data validation FAILED')
+    exit(1)
+
+print('✅ Data validation PASSED — dataset quality OK')
+print(f'   Rows: {len(df)}, Columns: {len(df.columns)}')
+"
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 4: Model Training ───────────────────────────
+        stage('🧠 Model Training') {
+            when {
+                anyOf {
+                    changeset "scripts/mlops/train.py"
+                    changeset "datasets/**"
+                    expression { params.FORCE_RETRAIN }
+                }
+            }
+            steps {
+                container('python') {
+                    sh """
+                        pip install --quiet \
+                          mlflow scikit-learn pandas numpy \
+                          torch xgboost shap boto3
+
+                        python3 scripts/mlops/train.py \
+                          --model-name ${params.MODEL_NAME} \
+                          --mlflow-uri ${MLFLOW_URI} \
+                          --s3-bucket ${S3_MODEL_BUCKET} \
+                          --experiment-name people-inc-${params.MODEL_NAME}
+                    """
+                }
+            }
+            post {
+                success {
+                    script {
+                        echo "✅ Model training complete — metrics logged to MLflow"
+                    }
+                }
+            }
+        }
+
+        // ── STAGE 5: Model Evaluation ─────────────────────────
+        stage('📈 Model Evaluation') {
+            steps {
+                container('python') {
+                    sh """
+                        python3 scripts/mlops/evaluate.py \
+                          --model-name ${params.MODEL_NAME} \
+                          --mlflow-uri ${MLFLOW_URI} \
+                          --min-accuracy ${params.MIN_ACCURACY} \
+                          --output-file /tmp/eval_results.json
+
+                        cat /tmp/eval_results.json
+                    """
+                }
+            }
+            post {
+                failure {
+                    error("❌ Model accuracy below ${params.MIN_ACCURACY} threshold — deploy blocked.")
+                }
+            }
+        }
+
+        // ── STAGE 6: MLflow Model Registration ───────────────
+        stage('📦 Register Model') {
+            steps {
+                container('python') {
+                    script {
+                        MODEL_VERSION = sh(
+                            script: """
+                                python3 scripts/mlops/register.py \
+                                  --model-name ${params.MODEL_NAME} \
+                                  --mlflow-uri ${MLFLOW_URI} \
+                                  --stage Staging
+                            """,
+                            returnStdout: true
+                        ).trim()
+                        echo "✅ Model registered: ${params.MODEL_NAME} v${MODEL_VERSION}"
+                    }
+                }
+            }
+        }
+
+        // ── STAGE 7: Docker Build ────────────────────────────
+        stage('🐳 Docker Build') {
+            steps {
+                container('docker') {
+                    sh """
+                        docker build \
+                          --build-arg MODEL_NAME=${params.MODEL_NAME} \
+                          --build-arg MODEL_VERSION=${MODEL_VERSION} \
+                          --build-arg BUILD_DATE=\$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                          --label "model.name=${params.MODEL_NAME}" \
+                          --label "model.version=${MODEL_VERSION}" \
+                          -t ${APP_NAME}:${IMAGE_TAG} \
+                          -f Dockerfile \
+                          .
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 8: Container Security Scan ─────────────────
+        stage('🔬 Trivy Scan') {
+            steps {
+                container('trivy') {
+                    sh """
+                        trivy image \
+                          --exit-code 1 \
+                          --severity CRITICAL \
+                          --no-progress \
+                          --format table \
+                          ${APP_NAME}:${IMAGE_TAG}
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 9: Push to ECR ──────────────────────────────
+        stage('📤 Push to ECR') {
+            steps {
+                container('docker') {
+                    sh """
+                        aws ecr get-login-password \
+                          --region ${AWS_REGION} | \
+                        docker login \
+                          --username AWS \
+                          --password-stdin ${ECR_REGISTRY}
+
+                        docker tag ${APP_NAME}:${IMAGE_TAG} ${ECR_REPO}:${IMAGE_TAG}
+                        docker tag ${APP_NAME}:${IMAGE_TAG} ${ECR_REPO}:latest
+                        docker push ${ECR_REPO}:${IMAGE_TAG}
+                        docker push ${ECR_REPO}:latest
+
+                        echo "✅ Pushed: ${ECR_REPO}:${IMAGE_TAG}"
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 10: Deploy Dev ──────────────────────────────
+        stage('🚀 Deploy — Dev') {
+            steps {
+                script {
+                    deployModel.deploy(
+                        env: 'dev',
+                        appName: APP_NAME,
+                        imageTag: IMAGE_TAG,
+                        modelName: params.MODEL_NAME,
+                        modelVersion: MODEL_VERSION,
+                        namespace: 'mlops-dev'
+                    )
+                }
+            }
+            post {
+                success {
+                    sh "bash scripts/health-checks/model-health.sh dev"
+                }
+            }
+        }
+
+        // ── STAGE 11: Integration Tests ───────────────────────
+        stage('🔗 Integration Tests') {
+            steps {
+                container('python') {
+                    sh """
+                        pip install --quiet pytest requests
+
+                        pytest tests/integration/ \
+                          --base-url=https://ai-dev.people.inc \
+                          --model-name=${params.MODEL_NAME} \
+                          -v
+                    """
+                }
+            }
+        }
+
+        // ── STAGE 12: Production Approval ────────────────────
+        stage('✅ Prod Approval') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    timeout(time: 30, unit: 'MINUTES') {
+                        input(
+                            message: "Deploy ${params.MODEL_NAME} v${MODEL_VERSION} to PRODUCTION?",
+                            ok: "✅ Approve",
+                            submitter: "mlops-leads,ai-engineering"
+                        )
+                    }
+                }
+            }
+        }
+
+        // ── STAGE 13: Deploy Production ───────────────────────
+        stage('🚀 Deploy — Production') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                script {
+                    deployModel.deploy(
+                        env: 'prod',
+                        appName: APP_NAME,
+                        imageTag: IMAGE_TAG,
+                        modelName: params.MODEL_NAME,
+                        modelVersion: MODEL_VERSION,
+                        namespace: 'mlops-prod'
+                    )
+                }
+            }
+            post {
+                success {
+                    sh "bash scripts/health-checks/model-health.sh prod"
+                    sh "bash scripts/health-checks/slo-check.sh --env prod"
+                }
+            }
+        }
+
+        // ── STAGE 14: Promote Model in MLflow ────────────────
+        stage('🏆 Promote to Production') {
+            when {
+                allOf {
+                    branch 'main'
+                    expression { params.DEPLOY_ENV == 'prod' }
+                }
+            }
+            steps {
+                container('python') {
+                    sh """
+                        python3 scripts/mlops/register.py \
+                          --model-name ${params.MODEL_NAME} \
+                          --mlflow-uri ${MLFLOW_URI} \
+                          --version ${MODEL_VERSION} \
+                          --stage Production
+                        echo "✅ Model promoted to Production in MLflow"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            script {
+                slackSend(
+                    channel: '#mlops-deployments',
+                    color: 'good',
+                    message: "✅ *MLOps Pipeline SUCCESS*\nModel: `${params.MODEL_NAME}` v${MODEL_VERSION}\nEnv: *${params.DEPLOY_ENV}* | Build: ${env.BUILD_URL}"
+                )
+            }
+        }
+        failure {
+            script {
+                slackSend(
+                    channel: '#mlops-deployments',
+                    color: 'danger',
+                    message: "❌ *MLOps Pipeline FAILED*\nModel: `${params.MODEL_NAME}`\nStage: `${env.STAGE_NAME}` | Build: ${env.BUILD_URL}"
+                )
+            }
+        }
+        always { cleanWs() }
+    }
+}
