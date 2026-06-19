@@ -1,0 +1,100 @@
+# ============================================================
+#  GitHub Actions — Scheduled Quarterly DR Drill
+#  Automatically tests failover capability without affecting
+#  real production traffic (runs against staging DR clone)
+#  Author: Venkatesh Nagelli
+# ============================================================
+
+name: Quarterly DR Drill
+
+on:
+  schedule:
+    # Runs at 02:00 UTC on the 1st of Jan, Apr, Jul, Oct (quarterly)
+    - cron: "0 2 1 1,4,7,10 *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run in dry-run mode (no actual changes)"
+        type: boolean
+        default: true
+
+jobs:
+
+  dr-drill:
+    name: 🧪 DR Drill — Staging Failover Test
+    runs-on: ubuntu-latest
+    environment: dr-drill-staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.DR_DRILL_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Set up kubectl contexts
+        run: |
+          aws eks update-kubeconfig --name banking-platform-primary-staging --alias primary-cluster
+          aws eks update-kubeconfig --name banking-platform-dr-staging --alias dr-cluster
+
+      - name: Install Ansible
+        run: pip install ansible boto3
+
+      - name: Validate backup recency (RPO compliance check)
+        run: |
+          python3 scripts/backup-validation/validate-backups.py \
+            --vault-name banking-platform-dr-vault-staging \
+            --tier tier1
+
+      - name: Pre-drill health check
+        run: |
+          bash scripts/health-checks/multi-region-health.sh --target primary
+          bash scripts/health-checks/multi-region-health.sh --target dr
+
+      - name: Execute failover drill (staging)
+        env:
+          AUTOMATED_TRIGGER: "true"
+          SLACK_DR_WEBHOOK: ${{ secrets.SLACK_DR_WEBHOOK }}
+        run: |
+          bash scripts/failover/trigger-failover.sh \
+            --reason "scheduled-quarterly-drill" \
+            ${{ inputs.dry_run == true && '--dry-run' || '' }}
+
+      - name: Post-drill validation
+        run: |
+          bash scripts/health-checks/multi-region-health.sh --target dr --post-cutover
+
+      - name: Run integration test suite against DR
+        run: |
+          pip install pytest requests
+          pytest tests/integration/test_dr_drill.py \
+            --base-url https://banking-platform-dr-staging.example.com \
+            -v
+
+      - name: Failback to primary (restore staging state)
+        if: always()
+        run: |
+          ansible-playbook ansible/playbooks/failback.yml \
+            -e "reason='post-drill-restore'"
+
+      - name: Record drill result
+        if: always()
+        run: |
+          echo "Drill completed at $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> docs/dr-drill-history.log
+          git config user.name "dr-drill-bot"
+          git config user.email "dr-drill-bot@users.noreply.github.com"
+          git add docs/dr-drill-history.log
+          git commit -m "chore: record DR drill result $(date -u +%Y-%m-%d)" || true
+          git push || true
+
+      - name: Notify on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "🚨 Quarterly DR drill FAILED — manual investigation required. See: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_DR_WEBHOOK }}

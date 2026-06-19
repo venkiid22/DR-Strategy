@@ -1,0 +1,33 @@
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# Ansible
+*.retry
+.vault_pass
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets
+*.pem
+*.key
+.env
+secrets/
+
+# Logs
+*.log
+docs/dr-drill-history.log
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/

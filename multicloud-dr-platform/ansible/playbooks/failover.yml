@@ -1,0 +1,133 @@
+# ============================================================
+#  Ansible Playbook: Automated Failover
+#  Promotes DR site to primary during an outage
+#  Author: Venkatesh Nagelli
+#  Usage : ansible-playbook failover.yml -e "reason='primary-outage'"
+# ============================================================
+---
+- name: Multi-Cloud Disaster Recovery — Automated Failover
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    app_name: "banking-platform"
+    primary_region: "us-east-1"
+    dr_region: "us-west-2"
+    slack_webhook: "{{ lookup('env', 'SLACK_DR_WEBHOOK') }}"
+
+  tasks:
+
+    - name: Record failover start time
+      set_fact:
+        failover_start: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Notify team — failover starting
+      uri:
+        url: "{{ slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: "🚨 *DR FAILOVER INITIATED*\nReason: {{ reason | default('manual trigger') }}\nTime: {{ failover_start }}\nTarget: {{ dr_region }}"
+
+    # ── Step 1: Validate DR site health before cutover ────────
+    - name: Check DR site database replica lag
+      shell: |
+        aws rds describe-db-instances \
+          --db-instance-identifier {{ app_name }}-dr-replica \
+          --region {{ dr_region }} \
+          --query 'DBInstances[0].StatusInfos' \
+          --output json
+      register: replica_status
+      changed_when: false
+
+    - name: Fail if replica is not in sync
+      fail:
+        msg: "DR replica is not healthy — aborting failover to prevent data loss"
+      when: "'error' in replica_status.stdout | lower"
+
+    - name: Check DR EKS cluster node health
+      shell: |
+        kubectl --context dr-cluster get nodes \
+          -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}'
+      register: dr_nodes_ready
+      changed_when: false
+
+    # ── Step 2: Promote RDS read replica to standalone primary ─
+    - name: Promote DR database replica
+      shell: |
+        aws rds promote-read-replica \
+          --db-instance-identifier {{ app_name }}-dr-replica \
+          --backup-retention-period 7 \
+          --region {{ dr_region }}
+      register: promote_result
+
+    - name: Wait for promotion to complete
+      shell: |
+        aws rds wait db-instance-available \
+          --db-instance-identifier {{ app_name }}-dr-replica \
+          --region {{ dr_region }}
+      register: promotion_wait
+      retries: 3
+      delay: 30
+
+    # ── Step 3: Scale up DR Kubernetes workloads ───────────────
+    - name: Scale DR application deployment to full capacity
+      shell: |
+        kubectl --context dr-cluster scale deployment {{ app_name }} \
+          --replicas=6 \
+          -n production
+      register: scale_result
+
+    - name: Wait for DR pods to be ready
+      shell: |
+        kubectl --context dr-cluster rollout status deployment/{{ app_name }} \
+          -n production \
+          --timeout=300s
+      register: rollout_status
+
+    # ── Step 4: DNS cutover via Route 53 ───────────────────────
+    - name: Trigger DNS failover cutover
+      command: >
+        python3 ../../scripts/failover/dns-cutover.py
+        --target {{ dr_region }}
+        --app-name {{ app_name }}
+      register: dns_cutover
+
+    # ── Step 5: Validate application health post-cutover ──────
+    - name: Run post-cutover health checks
+      shell: bash ../../scripts/health-checks/multi-region-health.sh --target dr --post-cutover
+      register: health_check_result
+      retries: 5
+      delay: 15
+      until: health_check_result.rc == 0
+
+    # ── Step 6: Record completion + notify ─────────────────────
+    - name: Record failover completion time
+      set_fact:
+        failover_end: "{{ now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ') }}"
+
+    - name: Notify team — failover complete
+      uri:
+        url: "{{ slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: >
+            ✅ *DR FAILOVER COMPLETE*
+            Started: {{ failover_start }}
+            Completed: {{ failover_end }}
+            Active site: {{ dr_region }}
+            Next step: open incident ticket and begin RCA
+
+    - name: Write failover audit log
+      copy:
+        content: |
+          Failover Event
+          ==============
+          Reason: {{ reason | default('manual trigger') }}
+          Started: {{ failover_start }}
+          Completed: {{ failover_end }}
+          DR Region: {{ dr_region }}
+          DNS Cutover: {{ dns_cutover.stdout | default('N/A') }}
+        dest: "/var/log/dr-failover-{{ failover_start }}.log"

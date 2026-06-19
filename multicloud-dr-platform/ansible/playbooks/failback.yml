@@ -1,0 +1,79 @@
+# ============================================================
+#  Ansible Playbook: Automated Failback
+#  Restores traffic to primary region after recovery
+#  Author: Venkatesh Nagelli
+#  Usage : ansible-playbook failback.yml -e "reason='primary-restored'"
+# ============================================================
+---
+- name: Multi-Cloud Disaster Recovery — Automated Failback
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    app_name: "banking-platform"
+    primary_region: "us-east-1"
+    dr_region: "us-west-2"
+    slack_webhook: "{{ lookup('env', 'SLACK_DR_WEBHOOK') }}"
+
+  tasks:
+
+    - name: Notify team — failback starting
+      uri:
+        url: "{{ slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: "🔄 *DR FAILBACK INITIATED*\nReason: {{ reason | default('manual trigger') }}"
+
+    # ── Step 1: Verify primary region is actually healthy ─────
+    - name: Verify primary region health before failback
+      shell: bash ../../scripts/health-checks/multi-region-health.sh --target primary
+      register: primary_health
+      failed_when: primary_health.rc != 0
+
+    # ── Step 2: Sync any data written to DR back to primary ───
+    - name: Re-sync data written during DR period back to primary
+      shell: |
+        aws s3 sync \
+          s3://{{ app_name }}-dr-replica-{{ dr_region }} \
+          s3://{{ app_name }}-primary \
+          --region {{ primary_region }}
+      register: data_sync
+
+    - name: Re-establish RDS read replica from primary (rebuild DR)
+      shell: |
+        aws rds create-db-instance-read-replica \
+          --db-instance-identifier {{ app_name }}-dr-replica \
+          --source-db-instance-identifier {{ app_name }}-primary \
+          --region {{ dr_region }}
+      register: rebuild_replica
+
+    # ── Step 3: Gradual traffic shift back to primary ──────────
+    - name: Restore Route 53 failover routing to primary
+      command: >
+        python3 ../../scripts/failover/dns-cutover.py
+        --target {{ primary_region }}
+        --app-name {{ app_name }}
+
+    - name: Scale down DR deployment to warm-standby capacity
+      shell: |
+        kubectl --context dr-cluster scale deployment {{ app_name }} \
+          --replicas=2 \
+          -n production
+
+    # ── Step 4: Final validation ────────────────────────────────
+    - name: Validate primary is serving traffic correctly
+      shell: bash ../../scripts/health-checks/multi-region-health.sh --target primary --post-cutover
+      register: final_check
+      retries: 5
+      delay: 15
+      until: final_check.rc == 0
+
+    - name: Notify team — failback complete
+      uri:
+        url: "{{ slack_webhook }}"
+        method: POST
+        body_format: json
+        body:
+          text: "✅ *DR FAILBACK COMPLETE* — Primary region ({{ primary_region }}) is serving traffic. DR site restored to warm-standby."

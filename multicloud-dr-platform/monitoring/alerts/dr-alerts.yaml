@@ -1,0 +1,87 @@
+# ============================================================
+#  Prometheus Alert Rules — Multi-Cloud DR Platform
+#  Author: Venkatesh Nagelli
+# ============================================================
+
+groups:
+
+  - name: disaster-recovery
+    rules:
+
+      - alert: DRReplicaLagHigh
+        expr: |
+          aws_rds_replica_lag_seconds{db_instance="banking-platform-dr-replica"} > 900
+        for: 5m
+        labels:
+          severity: critical
+          team: devops
+          pagerduty: "true"
+        annotations:
+          summary: "🚨 DR database replica lag exceeds 15 minutes"
+          description: "Replica lag is {{ $value | printf \"%.0f\" }}s — RPO at risk"
+          runbook: "https://github.com/venkiid2222/multicloud-dr-platform/blob/main/docs/runbook.md"
+
+      - alert: S3ReplicationDelayed
+        expr: |
+          aws_s3_replication_latency_seconds{bucket="banking-platform-primary"} > 1800
+        for: 10m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "S3 cross-region replication delayed beyond 30 min"
+          description: "Replication latency: {{ $value | printf \"%.0f\" }}s"
+
+      - alert: BackupJobFailed
+        expr: |
+          aws_backup_job_status{status="FAILED"} == 1
+        for: 0m
+        labels:
+          severity: critical
+          pagerduty: "true"
+        annotations:
+          summary: "🚨 AWS Backup job failed"
+          description: "Backup job for {{ $labels.resource_arn }} failed — RPO compliance at risk"
+
+      - alert: DRClusterNodesNotReady
+        expr: |
+          kube_node_status_condition{cluster="dr-cluster", condition="Ready", status="true"} == 0
+        for: 5m
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "DR cluster node not ready"
+          description: "Node {{ $labels.node }} in DR cluster is not Ready — warm standby degraded"
+
+      - alert: PrimaryRegionHealthCheckFailing
+        expr: |
+          aws_route53_health_check_status{check_name="primary-health"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          pagerduty: "true"
+        annotations:
+          summary: "🚨 Primary region health check failing — possible outage"
+          description: "Route 53 health check has failed for 2+ minutes. Automatic failover may trigger."
+
+      - alert: AzureBackupVaultSyncStale
+        expr: |
+          azure_backup_vault_last_sync_hours{vault="banking-platform-dr-vault"} > 24
+        for: 1h
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Azure backup vault sync stale (>24h)"
+          description: "Tertiary Azure backup path hasn't synced in {{ $value }}h"
+
+      - alert: DRDrillOverdue
+        expr: |
+          (time() - dr_last_successful_drill_timestamp) > (90 * 24 * 3600)
+        labels:
+          severity: warning
+          team: devops
+        annotations:
+          summary: "Quarterly DR drill overdue"
+          description: "No successful DR drill recorded in over 90 days — schedule one immediately"
